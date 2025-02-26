@@ -1,22 +1,36 @@
-import numpy as np
+# %%
+
+from base64 import b64encode
+
+import numpy
 import torch
-import torch.nn.functional as F
-import torchvision
-from datasets import load_dataset
-from diffusers import DDIMScheduler, DDPMPipeline
+from diffusers import AutoencoderKL, LMSDiscreteScheduler, UNet2DConditionModel
+from huggingface_hub import notebook_login
+
+# For video display:
+from IPython.display import HTML
 from matplotlib import pyplot as plt
+from pathlib import Path
 from PIL import Image
-from torchvision import transforms
+from torch import autocast
+from torchvision import transforms as tfms
 from tqdm.auto import tqdm
-from diffusers import AutoencoderKL, CLIPTokenizer, CLIPTextModel, UNet2DConditionModel, LMSDiscreteScheduler
+from transformers import CLIPTextModel, CLIPTokenizer, logging
+import os
 
-from diffusers import StableDiffusionPipeline
+torch.manual_seed(1)
+# if not (Path.home()/'.cache/huggingface'/'token').exists(): notebook_login()
+
+# Supress some unnecessary warnings when loading the CLIPTextModel
+logging.set_verbosity_error()
+
+# Set device
+torch_device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+if "mps" == torch_device: os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = "1"
 
 
 
-
-pipe = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4", variant="fp16", torch_dtype=torch.float16, use_auth_token=True).to("cuda")
-image = pipe("An astronaught scuba diving").images[0]
+# %%
 
 # Load the autoencoder model which will be used to decode the latents into image space.
 vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae")
@@ -36,13 +50,13 @@ vae = vae.to(torch_device)
 text_encoder = text_encoder.to(torch_device)
 unet = unet.to(torch_device);
 
-
+#%% 
 # Some settings
-prompt = ["A watercolor painting of an otter"]
+prompt = ["An oil painting of many cats"]
 height = 512                        # default height of Stable Diffusion
 width = 512                         # default width of Stable Diffusion
-num_inference_steps = 30            # Number of denoising steps
-guidance_scale = 7.5                # Scale for classifier-free guidance
+num_inference_steps = 100            # Number of denoising steps
+guidance_scale = 7.5            # Scale for classifier-free guidance
 generator = torch.manual_seed(32)   # Seed generator to create the inital latent noise
 batch_size = 1
 
@@ -65,13 +79,74 @@ def set_timesteps(scheduler, num_inference_steps):
 
 set_timesteps(scheduler,num_inference_steps)
 
-# Prep latents
-latents = torch.randn(
-  (batch_size, unet.in_channels, height // 8, width // 8),
-  generator=generator,
-)
+# Prep latents with optional symmetry
+batch_size = 1
+symmetry_type = "repeat"  # Options: "none", "vertical", "horizontal", "repeat"
+repeat_factor = 2  # Number of repetitions in each dimension (2 means 2x2 grid = 4 squares)
+
+
+if symmetry_type == "none":
+    # Standard asymmetric latents
+    latents = torch.randn(
+        (batch_size, unet.in_channels, height // 8, width // 8),
+        generator=generator,
+    )
+else:
+    if symmetry_type == "vertical":
+        # Generate only half of the latent noise (left side)
+        half_width = (width // 8) // 2  # Half width in latent space
+        half_latents = torch.randn(
+            (batch_size, unet.in_channels, height // 8, half_width),
+            generator=generator,
+        )
+        # Create the mirrored version (right side)
+        mirrored_half = torch.flip(half_latents, [3])  # Flip along width dimension
+        # Concatenate left and right
+        latents = torch.cat([half_latents, mirrored_half], dim=3)
+    
+    elif symmetry_type == "horizontal":
+        # Generate only half of the latent noise (top side)
+        half_height = (height // 8) // 2  # Half height in latent space
+        half_latents = torch.randn(
+            (batch_size, unet.in_channels, half_height, width // 8),
+            generator=generator,
+        )
+        # Create the mirrored version (bottom side)
+        mirrored_half = torch.flip(half_latents, [2])  # Flip along height dimension
+        # Concatenate top and bottom
+        latents = torch.cat([half_latents, mirrored_half], dim=2)
+    elif symmetry_type == "repeat":
+        # First create full-size latents
+        full_latents = torch.randn(
+            (batch_size, unet.in_channels, height // 8, width // 8),
+            generator=generator,
+        )
+        
+        # Calculate the size of each repeating section
+        # Use integer division to ensure exact splits
+        section_height = (height // 8) // repeat_factor
+        section_width = (width // 8) // repeat_factor + 5 
+        
+        # Extract the base pattern from the top-left section
+        # Be very precise with the slicing to avoid any overlap
+        base_pattern = full_latents[:, :, 0:section_height, 5:section_width].clone()
+        
+        # Create full pattern by stacking copies
+        rows = []
+        for i in range(repeat_factor):
+            # Create a row by concatenating horizontally
+            row = torch.cat([base_pattern.clone() for _ in range(repeat_factor)], dim=3)
+            rows.append(row)
+        # Stack all rows vertically
+        latents = torch.cat(rows, dim=2)
+        
+        # Verify the dimensions are exactly correct
+        expected_shape = (batch_size, unet.in_channels, height // 8, width // 8)
+        assert latents.shape == expected_shape, f"Shape mismatch: {latents.shape} vs {expected_shape}"
+
+# Move to device and scale
 latents = latents.to(torch_device)
-latents = latents * scheduler.init_noise_sigma # Scaling (previous versions did latents = latents * self.scheduler.sigmas[0]
+latents = latents * scheduler.init_noise_sigma
 
 # Loop
 with autocast("cuda"):  # will fallback to CPU if no CUDA; no autocast for MPS
@@ -106,3 +181,4 @@ image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
 images = (image * 255).round().astype("uint8")
 pil_images = [Image.fromarray(image) for image in images]
 pil_images[0]
+# %%
