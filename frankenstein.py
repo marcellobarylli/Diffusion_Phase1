@@ -116,33 +116,29 @@ else:
         # Concatenate top and bottom
         latents = torch.cat([half_latents, mirrored_half], dim=2)
     elif symmetry_type == "repeat":
-        # First create full-size latents
-        full_latents = torch.randn(
-            (batch_size, unet.in_channels, height // 8, width // 8),
+        # Calculate the exact dimensions needed
+        section_height = (height // 8) // repeat_factor
+        section_width = (width // 8) // repeat_factor
+        
+        # Generate just one base pattern of the exact size needed
+        base_pattern = torch.randn(
+            (batch_size, unet.in_channels, section_height, section_width),
             generator=generator,
         )
         
-        # Calculate the size of each repeating section
-        # Use integer division to ensure exact splits
-        section_height = (height // 8) // repeat_factor
-        section_width = (width // 8) // repeat_factor + 5 
+        # Ensure our final dimensions match what's expected
+        target_height = section_height * repeat_factor
+        target_width = section_width * repeat_factor
         
-        # Extract the base pattern from the top-left section
-        # Be very precise with the slicing to avoid any overlap
-        base_pattern = full_latents[:, :, 0:section_height, 5:section_width].clone()
-        
-        # Create full pattern by stacking copies
+        # Create full pattern by stacking exact copies
         rows = []
-        for i in range(repeat_factor):
-            # Create a row by concatenating horizontally
+        for _ in range(repeat_factor):
             row = torch.cat([base_pattern.clone() for _ in range(repeat_factor)], dim=3)
             rows.append(row)
-        # Stack all rows vertically
         latents = torch.cat(rows, dim=2)
         
-        # Verify the dimensions are exactly correct
-        expected_shape = (batch_size, unet.in_channels, height // 8, width // 8)
-        assert latents.shape == expected_shape, f"Shape mismatch: {latents.shape} vs {expected_shape}"
+        # Verify dimensions
+        assert latents.shape == (batch_size, unet.in_channels, height // 8, width // 8)
 
 # Move to device and scale
 latents = latents.to(torch_device)
